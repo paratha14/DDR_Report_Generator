@@ -6,16 +6,14 @@ import pytesseract
 import cv2
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
-# ── PDF Paths ──────────────────────────────────────────────────────────────────
+# ── Paths ──────────────────────────────────────────────────────────────────────
 source_data         = os.path.join(os.path.dirname(__file__), "..", "Source_Data")
 sample_report_path  = os.path.join(source_data, "Sample Report.pdf")
 thermal_images_path = os.path.join(source_data, "Thermal Images.pdf")
-
-# ── Output directories ─────────────────────────────────────────────────────────
-images_dir = os.path.join(os.path.dirname(__file__), "..", "extracted_images")
-output_dir = os.path.join(os.path.dirname(__file__), "..", "output")
+images_dir          = os.path.join(os.path.dirname(__file__), "..", "extracted_images")
+output_dir          = os.path.join(os.path.dirname(__file__), "..", "output")
 
 
 # ── Data Classes ───────────────────────────────────────────────────────────────
@@ -27,7 +25,7 @@ class AreaInfo:
     negative_side_photos: List[str] = field(default_factory=list)
     positive_side_photos: List[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
         return {
             "area_number": self.area_number,
             "negative_side_description": self.negative_side,
@@ -40,11 +38,11 @@ class AreaInfo:
 @dataclass
 class SummaryRow:
     point_no: str
-    impacted_area: str          # negative side description
+    impacted_area: str
     ref_point_no: str
-    exposed_area: str           # positive side description
+    exposed_area: str
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
         return {
             "point_no": self.point_no,
             "impacted_area_negative_side": self.impacted_area,
@@ -54,30 +52,33 @@ class SummaryRow:
 
 
 @dataclass
-class ChecklistSection:
-    name: str                           # e.g. "WC", "External wall"
-    score: str = "N/A"                  # e.g. "84.21%"
-    flagged_count: str = "N/A"
-    items: List[Dict[str, str]] = field(default_factory=list)  # [{"item": ..., "value": ...}]
+class ChecklistItem:
+    question: str
+    answer: str
 
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "score": self.score,
-            "flagged_count": self.flagged_count,
-            "items": self.items,
-        }
+    def to_dict(self):
+        return {"question": self.question, "answer": self.answer}
+
+
+@dataclass
+class ChecklistSection:
+    name: str
+    score: str = "N/A"
+    items: List[ChecklistItem] = field(default_factory=list)
+
+    def to_dict(self):
+        return {"name": self.name, "score": self.score, "items": [i.to_dict() for i in self.items]}
 
 
 @dataclass
 class SiteInfo:
-    impacted_areas: List[str] = field(default_factory=list)     # rooms/zones (site location)
-    areas: List[AreaInfo] = field(default_factory=list)          # impacted area details
+    impacted_areas: List[str] = field(default_factory=list)
+    areas: List[AreaInfo] = field(default_factory=list)
     summary_table: List[SummaryRow] = field(default_factory=list)
     checklists: List[ChecklistSection] = field(default_factory=list)
-    appendix_photos: List[str] = field(default_factory=list)     # paths to 64 appendix images
+    appendix_photos: List[str] = field(default_factory=list)
 
-    def to_json(self) -> dict:
+    def to_json(self):
         return {
             "impacted_areas": self.impacted_areas,
             "areas": [a.to_dict() for a in self.areas],
@@ -99,7 +100,7 @@ class ThermalReading:
     thermal_scan_path: Optional[str] = None
     photo_path: Optional[str] = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
         return {
             "page": self.page,
             "image_filename": self.image_filename,
@@ -113,9 +114,8 @@ class ThermalReading:
         }
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Low-level helpers ──────────────────────────────────────────────────────────
 def _get_page_text(page: pymupdf.Page) -> str:
-    """Return native text; fall back to Tesseract OCR for scanned pages."""
     text = page.get_text().strip()
     if text:
         return text
@@ -127,279 +127,281 @@ def _get_page_text(page: pymupdf.Page) -> str:
     return pytesseract.image_to_string(gray)
 
 
-def _parse_value(pattern: str, text: str, default: str = "N/A") -> str:
+def _pv(pattern, text, default="N/A"):
     m = re.search(pattern, text, re.IGNORECASE)
     return m.group(1).strip() if m else default
 
 
-def _save_image(doc: pymupdf.Document, xref: int, save_path: str) -> str:
-    """Extract an embedded image by xref and save as PNG."""
+def _clean(s: str) -> str:
+    return " ".join(s.split()).strip()
+
+
+def _save_img(doc: pymupdf.Document, xref: int, path: str) -> str:
     pix = pymupdf.Pixmap(doc, xref)
     if pix.colorspace and pix.colorspace.n > 3:
         pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    pix.save(save_path)
-    return save_path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pix.save(path)
+    return os.path.normpath(path)
 
 
-def _get_image_rects(page: pymupdf.Page, min_area: float = 2500):
-    """
-    Return a list of (rect, xref) for all non-tiny images on the page,
-    sorted top-to-bottom by their y-position.
-    Icons (hotspot/coldspot crosshairs, emissivity symbol, etc.) have a
-    small bounding box on the page and are filtered out by min_area.
-    """
-    placements = []
-    seen = set()
+def _page_text_positions(page: pymupdf.Page) -> List[Tuple[float, str]]:
+    """Return [(y, text)] for every text line, sorted top→bottom."""
+    result = []
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            txt = " ".join(s["text"] for s in line.get("spans", []))
+            if txt.strip():
+                result.append((line["bbox"][1], txt.strip()))
+    return sorted(result, key=lambda x: x[0])
+
+
+def _large_image_rects(page: pymupdf.Page, min_area=2500):
+    """Return [(rect, xref)] for non-tiny images, sorted top→bottom."""
+    seen, out = set(), []
     for img in page.get_images(full=True):
         xref = img[0]
         try:
-            rects = page.get_image_rects(xref)
-            for r in rects:
-                area = r.width * r.height
-                if area >= min_area:
+            for r in page.get_image_rects(xref):
+                if r.width * r.height >= min_area:
                     key = (round(r.x0, 1), round(r.y0, 1))
                     if key not in seen:
                         seen.add(key)
-                        placements.append((r, xref))
+                        out.append((r, xref))
         except Exception:
             pass
-    placements.sort(key=lambda x: x[0].y0)   # top → bottom
-    return placements
+    out.sort(key=lambda x: x[0].y0)
+    return out
 
 
-# ── Summary Table Parser ───────────────────────────────────────────────────────
-def _parse_summary_table(text: str) -> List[SummaryRow]:
+def _classify_page_images(page: pymupdf.Page, fallback: Optional[str]) -> Dict[int, str]:
     """
-    Parse the SUMMARY TABLE section.
-    Each row: point_no | impacted area description | ref_point_no | exposed area description
+    Map xref → 'negative'|'positive' using photo-section heading y-positions.
+    Falls back to `fallback` when no heading is found on this page.
     """
-    rows = []
-    section_match = re.search(
-        r"SUMMARY\s+TABLE(.+?)(?:Appendix|Inspection\s+Checklist|\Z)",
-        text, re.IGNORECASE | re.DOTALL
-    )
-    if not section_match:
-        return rows
+    neg_y = pos_y = None
+    for y, txt in _page_text_positions(page):
+        if neg_y is None and re.search(r"Negative\s+side\s+photo", txt, re.IGNORECASE):
+            neg_y = y
+        if pos_y is None and re.search(r"Positive\s+side\s+photo", txt, re.IGNORECASE):
+            pos_y = y
 
-    section = section_match.group(1)
-    lines = [l.strip() for l in section.splitlines() if l.strip()]
+    result = {}
+    for img in page.get_images(full=True):
+        xref = img[0]
+        side = fallback
+        try:
+            rects = page.get_image_rects(xref)
+            if rects:
+                iy = rects[0].y0
+                if neg_y is not None and pos_y is not None:
+                    side = "negative" if iy < pos_y else "positive"
+                elif neg_y is not None:
+                    side = "negative"
+                elif pos_y is not None:
+                    side = "positive"
+        except Exception:
+            pass
+        if side:
+            result[xref] = side
+    return result
 
-    # Lines look like: number, description, decimal_number, description (interleaved)
-    # Group by detecting lines that are purely point numbers (e.g. "1", "2", "1.1", "2.1")
+
+# ── Text-level parsers (operate on full_text) ──────────────────────────────────
+def _section_text(full_text: str, start_re: str, end_patterns: List[str]) -> str:
+    m = re.search(start_re, full_text, re.IGNORECASE)
+    if not m:
+        return ""
+    chunk = full_text[m.start():]
+    for pat in end_patterns:
+        e = re.search(pat, chunk, re.IGNORECASE)
+        if e:
+            chunk = chunk[:e.start()]
+    return chunk
+
+
+def _parse_impacted_areas(full_text: str) -> List[str]:
+    """Extract rooms list from 'Impacted Areas/Rooms' — single-line, comma-split."""
+    m = re.search(r"Impacted\s+Areas?[/\s]*Rooms?\s*\n?(.*?)(?:\n\n|\nImpacted\s+Area\b|\Z)",
+                  full_text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+    raw = m.group(1).strip()
+    tokens = [_clean(t) for t in re.split(r",|\n", raw) if _clean(t)]
+    noise  = re.compile(r"^(impacted\s+area|negative|positive|photo\s+\d+|site\s+details|\d+)$", re.IGNORECASE)
+    return [t for t in tokens if not noise.match(t)]
+
+
+def _parse_area_descriptions(full_text: str) -> Dict[int, AreaInfo]:
+    """Extract all numbered area blocks and their neg/pos descriptions."""
+    area_map: Dict[int, AreaInfo] = {}
+    # Grab section from first numbered area to checklists
+    section = _section_text(full_text,
+                            r"Impacted\s+Area\s+\d+",
+                            [r"Inspection\s+Checklists?", r"SUMMARY\s+TABLE"])
+    starts = list(re.finditer(r"Impacted\s+Area\s+(\d+)\b", section, re.IGNORECASE))
+    for i, m in enumerate(starts):
+        num   = int(m.group(1))
+        start = m.start()
+        end   = starts[i + 1].start() if i + 1 < len(starts) else len(section)
+        block = section[start:end]
+
+        area = AreaInfo(area_number=num)
+        neg = re.search(r"Negative\s+side\s+Description\s+(.*?)(?=\nNegative\s+side\s+photo|\nPositive\s+side|\Z)",
+                        block, re.IGNORECASE | re.DOTALL)
+        if neg:
+            area.negative_side = _clean(neg.group(1))
+
+        pos = re.search(r"Positive\s+side\s+Description\s+(.*?)(?=\nPositive\s+side\s+photo|\nImpacted\s+Area|\Z)",
+                        block, re.IGNORECASE | re.DOTALL)
+        if pos:
+            area.positive_side = _clean(pos.group(1))
+
+        area_map[num] = area
+    return area_map
+
+
+def _parse_summary_table(full_text: str) -> List[SummaryRow]:
+    rows    = []
+    section = _section_text(full_text, r"SUMMARY\s+TABLE", [r"Appendix", r"Inspection\s+Checklist"])
+    lines   = [l.strip() for l in section.splitlines() if l.strip()]
     i = 0
-    neg_point = neg_desc = ref_point = pos_desc = ""
     while i < len(lines):
-        line = lines[i]
-        # Main point number (integer)
-        if re.fullmatch(r"\d+", line):
-            neg_point = line
-            neg_desc  = lines[i + 1] if i + 1 < len(lines) else ""
-            # Concatenate continuation lines until we hit a decimal point number or end
-            j = i + 2
-            while j < len(lines) and not re.fullmatch(r"\d+\.\d+", lines[j]):
-                neg_desc += " " + lines[j]
-                j += 1
-            # Decimal reference point (e.g. 1.1)
-            if j < len(lines) and re.fullmatch(r"\d+\.\d+", lines[j]):
-                ref_point = lines[j]
-                pos_desc  = lines[j + 1] if j + 1 < len(lines) else ""
-                k = j + 2
-                while k < len(lines) and not re.fullmatch(r"\d+", lines[k]) and not re.fullmatch(r"\d+\.\d+", lines[k]):
-                    pos_desc += " " + lines[k]
-                    k += 1
-                i = k
-            else:
-                i = j
-            rows.append(SummaryRow(
-                point_no     = neg_point,
-                impacted_area= neg_desc.strip(),
-                ref_point_no = ref_point,
-                exposed_area = pos_desc.strip(),
-            ))
+        if re.fullmatch(r"\d+", lines[i]):
+            neg_pt = lines[i]; i += 1
+            neg_parts = []
+            while i < len(lines) and not re.fullmatch(r"\d+\.\d+|\d+", lines[i]):
+                neg_parts.append(lines[i]); i += 1
+            ref_pt = pos_parts = ""
+            if i < len(lines) and re.fullmatch(r"\d+\.\d+", lines[i]):
+                ref_pt = lines[i]; i += 1
+                pos_acc = []
+                while i < len(lines) and not re.fullmatch(r"\d+", lines[i]) and not re.fullmatch(r"\d+\.\d+", lines[i]):
+                    pos_acc.append(lines[i]); i += 1
+                pos_parts = " ".join(pos_acc)
+            rows.append(SummaryRow(neg_pt, " ".join(neg_parts), ref_pt, pos_parts))
         else:
             i += 1
-
     return rows
 
 
-# ── Checklist Parser ───────────────────────────────────────────────────────────
-def _parse_checklists(text: str) -> List[ChecklistSection]:
-    """
-    Parse the Inspection Checklists section.
-    Each sub-section has a name, score, flagged count, and key-value items.
-    """
-    checklists = []
-    section_match = re.search(
-        r"Inspection\s+Checklists?(.+?)(?:SUMMARY\s+TABLE|\Z)",
-        text, re.IGNORECASE | re.DOTALL
-    )
-    if not section_match:
-        return checklists
+def _parse_checklists(full_text: str) -> List[ChecklistSection]:
+    section = _section_text(full_text, r"Inspection\s+Checklists?", [r"SUMMARY\s+TABLE"])
+    if not section:
+        return []
 
-    section = section_match.group(1)
+    ANSWERS  = re.compile(r"^(Yes|No|N/A|Moderate|All\s*time|Not\s*sure|\d+\.?\d*%|Vitrified|Ceramic|Good|Poor|Fair)$", re.IGNORECASE)
+    SUBSEC   = re.compile(r"(Negative\s+Side\s+Inputs|Positive\s+Side\s+Inputs|Structural\s+Condition\s+of\s+RCC|Condition\s+of\s+External\s+wall|Condition\s+of\s+Adhesion)", re.IGNORECASE)
+    NOISE    = re.compile(r"^(Inspection\s+Checklists?|Photo\s+\d+|Impacted\s+Area\s*\d*|Negative\s+side\s+(photo|desc)|Positive\s+side\s+(photo|desc)|Checklists?\s*:?|Appendix|\d+\s+flagged|SUMMARY)$", re.IGNORECASE)
+    SCOREONLY= re.compile(r"^\d+\.?\d*%$")
 
-    # Sub-sections are headed by checklist names like "WC", "External wall", etc.
-    # preceded by a score percentage and "N flagged"
-    sub_sections = re.split(r"(?=Checklist\s*:)", section, flags=re.IGNORECASE)
+    lines = [l.strip() for l in section.splitlines() if l.strip()]
+    checklists: List[ChecklistSection] = []
+    cur_name  = "General"
+    cur_score = "N/A"
+    cur_items : List[ChecklistItem] = []
 
-    for sub in sub_sections:
-        if not sub.strip():
-            continue
-        lines = [l.strip() for l in sub.splitlines() if l.strip()]
-        if not lines:
-            continue
+    def flush():
+        if cur_items:
+            checklists.append(ChecklistSection(name=cur_name, score=cur_score, items=list(cur_items)))
 
-        # Score and flagged count appear before the checklist items
-        score_match   = re.search(r"(\d+\.?\d*%)", sub)
-        flagged_match = re.search(r"(\d+)\s+flagged", sub, re.IGNORECASE)
-        name_match    = re.search(r"Checklist\s*:\s*(.+?)(?:\n|$)", sub, re.IGNORECASE)
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if NOISE.match(ln):               i += 1; continue
+        if SCOREONLY.match(ln):           cur_score = ln; i += 1; continue
+        if SUBSEC.search(ln):
+            flush(); cur_name = ln; cur_score = "N/A"; cur_items = []; i += 1; continue
 
-        name    = name_match.group(1).strip() if name_match else lines[0]
-        score   = score_match.group(1) if score_match else "N/A"
-        flagged = flagged_match.group(1) + " flagged" if flagged_match else "N/A"
+        # Try single-line Q + answer
+        if i + 1 < len(lines) and ANSWERS.match(lines[i + 1]) and not NOISE.match(ln):
+            cur_items.append(ChecklistItem(question=ln, answer=lines[i + 1])); i += 2; continue
+        # Try two-line Q + answer
+        if i + 2 < len(lines) and not ANSWERS.match(lines[i + 1]) and ANSWERS.match(lines[i + 2]) and not NOISE.match(ln):
+            cur_items.append(ChecklistItem(question=ln + " " + lines[i + 1], answer=lines[i + 2])); i += 3; continue
 
-        # Key-value items: question line followed by answer (Yes/No/N/A/Moderate/percentage/text)
-        items = []
-        answer_keywords = re.compile(
-            r"^(Yes|No|N/A|Moderate|All\s+time|Not\s+sure|\d+\.?\d*%|[\w\s]+)$",
-            re.IGNORECASE
-        )
-        # Extract after "Checklist:" header block
-        item_section = re.sub(r".*?Checklist\s*:.*?\n", "", sub, count=1, flags=re.IGNORECASE | re.DOTALL)
-        item_lines = [l.strip() for l in item_section.splitlines() if l.strip()]
+        i += 1
 
-        i = 0
-        while i < len(item_lines):
-            q = item_lines[i]
-            # Skip pure percentage/score lines at top level
-            if re.fullmatch(r"\d+\.?\d*%", q) or re.fullmatch(r"\d+\s+flagged", q, re.IGNORECASE):
-                i += 1
-                continue
-            # Next non-empty line is the answer if it's short
-            if i + 1 < len(item_lines):
-                a = item_lines[i + 1]
-                if len(a) <= 30 and answer_keywords.match(a):
-                    items.append({"item": q, "value": a})
-                    i += 2
-                    continue
-            items.append({"item": q, "value": "—"})
-            i += 1
-
-        checklists.append(ChecklistSection(
-            name=name, score=score, flagged_count=flagged, items=items
-        ))
-
+    flush()
     return checklists
 
 
 # ── Sample Report Extraction ───────────────────────────────────────────────────
-
-# Section states for the page-by-page pass
-_SEC_AREA      = "impacted_area"
-_SEC_CHECKLIST = "checklist"
-_SEC_SUMMARY   = "summary_table"
-_SEC_APPENDIX  = "appendix"
-
-
 def extract_site_info(pdf_path: str = sample_report_path) -> SiteInfo:
-    """
-    Extracts from Sample Report.pdf:
-      - impacted_areas     → physical location (rooms/zones)
-      - areas              → per-area descriptions + photos
-      - summary_table      → structured summary rows
-      - checklists         → checklist items and scores
-      - appendix_photos    → 64 appendix images saved to disk
-    """
-    doc  = pymupdf.open(pdf_path)
-    site = SiteInfo()
-    full_text = "\n".join(_get_page_text(p) for p in doc)
+    doc      = pymupdf.open(pdf_path)
+    site     = SiteInfo()
+    full_text= "\n".join(_get_page_text(p) for p in doc)
 
-    # ── 1. Site location: only the rooms line ─────────────────────────────────
-    rooms_match = re.search(
-        r"Impacted\s+Areas?[/\s]*Rooms?\s*[:\-]?\s*(.+?)(?:\n)",
-        full_text, re.IGNORECASE
-    )
-    if rooms_match:
-        raw = rooms_match.group(1).strip()
-        site.impacted_areas = [r.strip() for r in re.split(r",", raw) if r.strip()]
+    # Text-level extractions
+    site.impacted_areas = _parse_impacted_areas(full_text)
+    area_map            = _parse_area_descriptions(full_text)
+    site.summary_table  = _parse_summary_table(full_text)
+    site.checklists     = _parse_checklists(full_text)
 
-    # ── 2. Summary table ──────────────────────────────────────────────────────
-    site.summary_table = _parse_summary_table(full_text)
-
-    # ── 3. Checklists ─────────────────────────────────────────────────────────
-    site.checklists = _parse_checklists(full_text)
-
-    # ── 4. Page-by-page: track sections → save images with structured labels ──
-    current_section  : str          = _SEC_AREA
-    current_area_num : Optional[int]= None
-    current_side     : Optional[str]= None   # "negative" | "positive"
-    area_map : Dict[int, AreaInfo]  = {}
-    img_counter: Dict[str, int]     = {}
-    appendix_count: int             = 0
+    # Page-by-page image saving
+    current_area: Optional[int] = None
+    current_side: Optional[str] = None
+    in_appendix                 = False
+    appendix_count              = 0
+    counters: Dict[str, int]    = {}   # "areaN_side" → image count
 
     for page_num, page in enumerate(doc):
         text = _get_page_text(page)
 
-        # ── Detect section transitions ─────────────────────────────────────────
+        # Appendix detection
         if re.search(r"^\s*Appendix\s*$", text, re.IGNORECASE | re.MULTILINE):
-            current_section = _SEC_APPENDIX
-        elif re.search(r"SUMMARY\s+TABLE", text, re.IGNORECASE):
-            current_section = _SEC_SUMMARY
-        elif re.search(r"Inspection\s+Checklists?", text, re.IGNORECASE):
-            current_section = _SEC_CHECKLIST
-        elif re.search(r"Impacted\s+Area\s+\d+", text, re.IGNORECASE):
-            current_section = _SEC_AREA
+            in_appendix = True
 
-        # ── Impacted area section ──────────────────────────────────────────────
-        if current_section == _SEC_AREA:
-            area_match = re.search(r"Impacted\s+Area\s+(\d+)", text, re.IGNORECASE)
-            if area_match:
-                current_area_num = int(area_match.group(1))
-                if current_area_num not in area_map:
-                    area_map[current_area_num] = AreaInfo(area_number=current_area_num)
-
-            if current_area_num and re.search(r"Negative\s+side\s+Description", text, re.IGNORECASE):
-                current_side = "negative"
-                area_map[current_area_num].negative_side = _parse_value(
-                    r"Negative\s+side\s+Description\s*[:\-]?\s*(.+?)(?:\n|Positive|$)", text
-                )
-
-            if current_area_num and re.search(r"Positive\s+side\s+Description", text, re.IGNORECASE):
-                current_side = "positive"
-                area_map[current_area_num].positive_side = _parse_value(
-                    r"Positive\s+side\s+Description\s*[:\-]?\s*(.+?)(?:\n|$)", text
-                )
-
-            for img_info in page.get_images(full=True):
-                if current_area_num is None or current_side is None:
-                    continue
-                xref = img_info[0]
-                key  = f"area_{current_area_num}_{current_side}"
-                img_counter[key] = img_counter.get(key, 0) + 1
-                save_path = os.path.join(
-                    images_dir, "sample_doc",
-                    f"impacted_area_{current_area_num}",
-                    current_side,
-                    f"img_{img_counter[key]}.png"
-                )
-                _save_image(doc, xref, save_path)
-                if current_side == "negative":
-                    area_map[current_area_num].negative_side_photos.append(save_path)
-                else:
-                    area_map[current_area_num].positive_side_photos.append(save_path)
-
-        # ── Appendix section ───────────────────────────────────────────────────
-        elif current_section == _SEC_APPENDIX:
-            for img_info in page.get_images(full=True):
+        if in_appendix:
+            for img in page.get_images(full=True):
                 appendix_count += 1
-                xref = img_info[0]
-                save_path = os.path.join(
-                    images_dir, "sample_doc", "appendix",
-                    f"img_{appendix_count}.png"
-                )
-                _save_image(doc, xref, save_path)
-                site.appendix_photos.append(save_path)
+                path = _save_img(doc, img[0], os.path.join(
+                    images_dir, "sample_doc", "appendix", f"img_{appendix_count}.png"))
+                site.appendix_photos.append(path)
+            continue
+
+        # Skip non-area pages (checklist/summary pages, no impacted area text)
+        if re.search(r"Inspection\s+Checklists?|SUMMARY\s+TABLE", text, re.IGNORECASE) \
+                and not re.search(r"Impacted\s+Area\s+\d+", text, re.IGNORECASE):
+            continue
+
+        # Update current area: use LAST area number found on this page
+        all_areas = re.findall(r"Impacted\s+Area\s+(\d+)", text, re.IGNORECASE)
+        if all_areas:
+            current_area = int(all_areas[-1])
+            if current_area not in area_map:
+                area_map[current_area] = AreaInfo(area_number=current_area)
+
+        if current_area is None:
+            continue
+
+        # Decide side per image using position-aware classification
+        page_sides = _classify_page_images(page, fallback=current_side)
+
+        # Update current_side from page headings for carry-forward
+        for _, ln in _page_text_positions(page):
+            if re.search(r"Negative\s+side\s+photo", ln, re.IGNORECASE):
+                current_side = "negative"
+            if re.search(r"Positive\s+side\s+photo", ln, re.IGNORECASE):
+                current_side = "positive"
+
+        for img in page.get_images(full=True):
+            xref = img[0]
+            side = page_sides.get(xref)
+            if not side:
+                continue
+            key = f"{current_area}_{side}"
+            counters[key] = counters.get(key, 0) + 1
+            path = _save_img(doc, xref, os.path.join(
+                images_dir, "sample_doc",
+                f"impacted_area_{current_area}", side,
+                f"img_{counters[key]}.png"))
+            if side == "negative":
+                area_map[current_area].negative_side_photos.append(path)
+            else:
+                area_map[current_area].positive_side_photos.append(path)
 
     doc.close()
     site.areas = sorted(area_map.values(), key=lambda a: a.area_number)
@@ -408,100 +410,67 @@ def extract_site_info(pdf_path: str = sample_report_path) -> SiteInfo:
 
 # ── Thermal Report Extraction ──────────────────────────────────────────────────
 def extract_thermal_data(pdf_path: str = thermal_images_path) -> List[ThermalReading]:
-    """
-    Per page extracts from Thermal Images.pdf:
-      - Metadata: image filename, date, hotspot, coldspot, emissivity, reflected temp
-      - Images: thermal scan (img 1) and regular photo (img 2) saved to disk
-    """
     doc      = pymupdf.open(pdf_path)
     readings = []
-
     for page_num, page in enumerate(doc):
         text = _get_page_text(page)
-
-        reading = ThermalReading(
+        r = ThermalReading(
             page           = page_num + 1,
-            image_filename = _parse_value(r"Thermal\s+image\s*[:\-]?\s*(\S+)", text),
-            date           = _parse_value(r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", text),
-            hotspot        = _parse_value(r"Hotspot\s*[:\-]?\s*([\d.]+\s*°?\s*C)", text),
-            coldspot       = _parse_value(r"Coldspot\s*[:\-]?\s*([\d.]+\s*°?\s*C)", text),
-            emissivity     = _parse_value(r"Emissivity\s*[:\-]?\s*([\d.]+)", text),
-            reflected_temp = _parse_value(r"Reflected\s+temperature\s*[:\-]?\s*([\d.]+\s*°?\s*C)", text),
+            image_filename = _pv(r"Thermal\s+image\s*[:\-]?\s*(\S+)", text),
+            date           = _pv(r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", text),
+            hotspot        = _pv(r"Hotspot\s*[:\-]?\s*([\d.]+\s*°?\s*C)", text),
+            coldspot       = _pv(r"Coldspot\s*[:\-]?\s*([\d.]+\s*°?\s*C)", text),
+            emissivity     = _pv(r"Emissivity\s*[:\-]?\s*([\d.]+)", text),
+            reflected_temp = _pv(r"Reflected\s+temperature\s*[:\-]?\s*([\d.]+\s*°?\s*C)", text),
         )
-
-        page_folder = os.path.join(images_dir, "thermal_doc", f"page_{page_num + 1}")
-        os.makedirs(page_folder, exist_ok=True)
-
-        # Use page-render approach: find image bounding boxes on the page
-        # (sorted top→bottom) then render each region with get_pixmap(clip=rect).
-        # This captures the RENDERED output (with the thermal colour gradient)
-        # rather than the raw embedded bytes (which are grayscale IR data).
-        placements = _get_image_rects(page)
-
-        scale = pymupdf.Matrix(2, 2)   # 2× zoom for sharpness
-
+        folder     = os.path.join(images_dir, "thermal_doc", f"page_{page_num + 1}")
+        placements = _large_image_rects(page)
+        scale      = pymupdf.Matrix(2, 2)
         if len(placements) >= 1:
-            rect, _ = placements[0]    # topmost large image = thermal scan
-            pix  = page.get_pixmap(matrix=scale, clip=rect)
-            path = os.path.join(page_folder, "thermal_scan.png")
-            pix.save(path)
-            reading.thermal_scan_path = path
-
+            rect, _ = placements[0]
+            pix = page.get_pixmap(matrix=scale, clip=rect)
+            path = os.path.join(folder, "thermal_scan.png")
+            os.makedirs(folder, exist_ok=True); pix.save(path)
+            r.thermal_scan_path = os.path.normpath(path)
         if len(placements) >= 2:
-            rect, _ = placements[1]    # second image (below) = regular photo
-            pix  = page.get_pixmap(matrix=scale, clip=rect)
-            path = os.path.join(page_folder, "photo.png")
+            rect, _ = placements[1]
+            pix = page.get_pixmap(matrix=scale, clip=rect)
+            path = os.path.join(folder, "photo.png")
             pix.save(path)
-            reading.photo_path = path
-
-        readings.append(reading)
-
+            r.photo_path = os.path.normpath(path)
+        readings.append(r)
     doc.close()
     return readings
 
 
-# ── Combined JSON Export ───────────────────────────────────────────────────────
+# ── Combined Export ────────────────────────────────────────────────────────────
 def extract_all_to_json(save: bool = True) -> dict:
-    """
-    Run both extractions, save all images, and return a unified JSON dict.
-    Writes JSON to output/extracted_data.json when save=True.
-    """
     print("► Extracting Sample Report...")
     site = extract_site_info()
-
     print("► Extracting Thermal Images...")
     readings = extract_thermal_data()
-
     result = {
         "sample_report": site.to_json(),
         "thermal_report": [r.to_dict() for r in readings],
     }
-
     if save:
         os.makedirs(output_dir, exist_ok=True)
-        json_path = os.path.join(output_dir, "extracted_data.json")
-        with open(json_path, "w", encoding="utf-8") as f:
+        path = os.path.join(output_dir, "extracted_data.json")
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
-        print(f"✓ JSON saved    → {json_path}")
-        print(f"✓ Images saved  → {images_dir}")
-
+        print(f"✓ JSON → {path}")
+        print(f"✓ Images → {images_dir}")
     return result
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     data = extract_all_to_json(save=True)
-
-    sr = data["sample_report"]
+    sr   = data["sample_report"]
     print(f"\n=== SAMPLE REPORT ===")
-    print(f"  Location (rooms)   : {', '.join(sr['impacted_areas'])}")
-    print(f"  Impacted areas     : {len(sr['areas'])}")
-    print(f"  Summary table rows : {len(sr['summary_table'])}")
-    print(f"  Checklist sections : {len(sr['checklists'])}")
-    print(f"  Appendix photos    : {len(sr['appendix_photos'])}")
-
-    print(f"\n=== THERMAL REPORT ===")
-    print(f"  Total pages : {len(data['thermal_report'])}")
-    for r in data["thermal_report"][:3]:
-        print(f"  Page {r['page']}: {r['image_filename']} | {r['hotspot']} / {r['coldspot']}")
-    print("  ...")
+    print(f"  Rooms          : {', '.join(sr['impacted_areas'])}")
+    print(f"  Areas found    : {len(sr['areas'])}")
+    print(f"  Summary rows   : {len(sr['summary_table'])}")
+    print(f"  Checklist secs : {len(sr['checklists'])}")
+    print(f"  Appendix imgs  : {len(sr['appendix_photos'])}")
+    print(f"\n=== THERMAL ===")
+    print(f"  Pages : {len(data['thermal_report'])}")
